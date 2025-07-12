@@ -18,15 +18,12 @@ const TerminalBuffer = @import("tui/TerminalBuffer.zig");
 const Session = @import("tui/components/Session.zig");
 const Text = @import("tui/components/Text.zig");
 const InfoLine = @import("tui/components/InfoLine.zig");
-const UserList = @import("tui/components/UserList.zig");
 const Config = @import("config/Config.zig");
 const Lang = @import("config/Lang.zig");
 const Save = @import("config/Save.zig");
 const migrator = @import("config/migrator.zig");
 const SharedError = @import("SharedError.zig");
-const UidRange = @import("UidRange.zig");
 
-const StringList = std.ArrayListUnmanaged([]const u8);
 const Ini = ini.Ini;
 const DisplayServer = enums.DisplayServer;
 const Entry = Environment.Entry;
@@ -396,22 +393,7 @@ pub fn main() !void {
         try crawl(&session, lang, dir, .custom);
     }
 
-    var usernames = try getAllUsernames(allocator, config.login_defs_path);
-    defer {
-        for (usernames.items) |username| allocator.free(username);
-        usernames.deinit(allocator);
-    }
-
-    if (usernames.items.len == 0) {
-        // If we have no usernames, simply add an error to the info line.
-        // This effectively means you can't login, since there would be no local
-        // accounts *and* no root account...but at this point, if that's the
-        // case, you have bigger problems to deal with in the first place. :D
-        try info_line.addMessage(lang.err_no_users, config.error_bg, config.error_fg);
-        try log_writer.writeAll("no users found\n");
-    }
-
-    var login = try UserList.init(allocator, &buffer, usernames);
+    var login = Text.init(allocator, &buffer, false, null);
     defer login.deinit();
 
     var password = Text.init(allocator, &buffer, true, config.asterisk);
@@ -423,17 +405,9 @@ pub fn main() !void {
     // Load last saved username and desktop selection, if any
     if (config.save) {
         if (save.user) |user| {
-            // Find user with saved name, and switch over to it
-            // If it doesn't exist (anymore), we don't change the value
-            // Note that we could instead save the username index, but migrating
-            // from the raw username to an index is non-trivial and I'm lazy :P
-            for (usernames.items, 0..) |username, i| {
-                if (std.mem.eql(u8, username, user)) {
-                    login.label.current = i;
-                    break;
-                }
-            }
-
+            try login.text.appendSlice(login.allocator, user);
+            login.end = user.len;
+            login.cursor = login.end;
             active_input = .password;
         }
 
@@ -449,13 +423,16 @@ pub fn main() !void {
         const coordinates = buffer.calculateComponentCoordinates();
         info_line.label.position(coordinates.start_x, coordinates.y, coordinates.full_visible_length, null);
         session.label.position(coordinates.x, coordinates.y + 2, coordinates.visible_length, config.text_in_center);
-        login.label.position(coordinates.x, coordinates.y + 4, coordinates.visible_length, config.text_in_center);
+        login.position(coordinates.x, coordinates.y + 4, coordinates.visible_length);
         password.position(coordinates.x, coordinates.y + 6, coordinates.visible_length);
 
         switch (active_input) {
             .info_line => info_line.label.handle(null, insert_mode),
             .session => session.label.handle(null, insert_mode),
-            .login => login.label.handle(null, insert_mode),
+            .login => login.handle(null, insert_mode) catch |err| {
+                try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
+                try log_writer.print("failed to handle login input: {s}\n", .{@errorName(err)});
+            },
             .password => password.handle(null, insert_mode) catch |err| {
                 try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
                 try log_writer.print("failed to handle password input: {s}\n", .{@errorName(err)});
@@ -600,7 +577,7 @@ pub fn main() !void {
                 const coordinates = buffer.calculateComponentCoordinates();
                 info_line.label.position(coordinates.start_x, coordinates.y, coordinates.full_visible_length, null);
                 session.label.position(coordinates.x, coordinates.y + 2, coordinates.visible_length, config.text_in_center);
-                login.label.position(coordinates.x, coordinates.y + 4, coordinates.visible_length, config.text_in_center);
+                login.position(coordinates.x, coordinates.y + 4, coordinates.visible_length);
                 password.position(coordinates.x, coordinates.y + 6, coordinates.visible_length);
 
                 resolution_changed = false;
@@ -609,7 +586,10 @@ pub fn main() !void {
             switch (active_input) {
                 .info_line => info_line.label.handle(null, insert_mode),
                 .session => session.label.handle(null, insert_mode),
-                .login => login.label.handle(null, insert_mode),
+                .login => login.handle(null, insert_mode) catch |err| {
+                    try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
+                    try log_writer.print("failed to handle login input: {s}\n", .{@errorName(err)});
+                },
                 .password => password.handle(null, insert_mode) catch |err| {
                     try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
                     try log_writer.print("failed to handle password input: {s}\n", .{@errorName(err)});
@@ -712,7 +692,7 @@ pub fn main() !void {
             }
 
             session.label.draw();
-            login.label.draw();
+            login.draw();
             password.draw();
 
             _ = termbox.tb_present();
@@ -791,9 +771,14 @@ pub fn main() !void {
                 }
             },
             termbox.TB_KEY_CTRL_C => run = false,
-            termbox.TB_KEY_CTRL_U => if (active_input == .password) {
-                password.clear();
-                update = true;
+            termbox.TB_KEY_CTRL_U => {
+                if (active_input == .login) {
+                    login.clear();
+                    update = true;
+                } else if (active_input == .password) {
+                    password.clear();
+                    update = true;
+                }
             },
             termbox.TB_KEY_CTRL_K, termbox.TB_KEY_ARROW_UP => {
                 active_input = switch (active_input) {
@@ -861,7 +846,7 @@ pub fn main() !void {
                     var writer = &file_writer.interface;
 
                     const save_data = Save{
-                        .user = login.getCurrentUser(),
+                        .user = login.text.items,
                         .session_index = session.label.current,
                     };
                     ini.writeFromStruct(save_data, writer, null, .{}) catch break :save_last_settings;
@@ -898,7 +883,7 @@ pub fn main() !void {
                         };
                         std.posix.sigaction(std.posix.SIG.CHLD, &tty_control_transfer_act, null);
 
-                        auth.authenticate(allocator, log_writer, auth_options, current_environment, login.getCurrentUser(), password.text.items) catch |err| {
+                        auth.authenticate(allocator, log_writer, auth_options, current_environment, login.text.items, password.text.items) catch |err| {
                             shared_err.writeError(err);
                             std.process.exit(1);
                         };
@@ -985,7 +970,9 @@ pub fn main() !void {
                 switch (active_input) {
                     .info_line => info_line.label.handle(&event, insert_mode),
                     .session => session.label.handle(&event, insert_mode),
-                    .login => login.label.handle(&event, insert_mode),
+                    .login => login.handle(&event, insert_mode) catch {
+                        try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
+                    },
                     .password => password.handle(&event, insert_mode) catch {
                         try info_line.addMessage(lang.err_alloc, config.error_bg, config.error_fg);
                     },
@@ -1085,66 +1072,6 @@ fn crawl(session: *Session, lang: Lang, path: []const u8, display_server: Displa
             .is_terminal = entry.Terminal orelse false,
         });
     }
-}
-
-fn getAllUsernames(allocator: std.mem.Allocator, login_defs_path: []const u8) !StringList {
-    const uid_range = try getUserIdRange(allocator, login_defs_path);
-
-    var usernames: StringList = .empty;
-    var maybe_entry = interop.getNextUsernameEntry();
-
-    while (maybe_entry) |entry| {
-        // We check if the UID is equal to 0 because we always want to add root
-        // as a username (even if you can't log into it)
-        if (entry.uid >= uid_range.uid_min and entry.uid <= uid_range.uid_max or entry.uid == 0 and entry.username != null) {
-            const username = try allocator.dupe(u8, entry.username.?);
-            try usernames.append(allocator, username);
-        }
-
-        maybe_entry = interop.getNextUsernameEntry();
-    }
-
-    interop.closePasswordDatabase();
-    return usernames;
-}
-
-// This is very bad parsing, but we only need to get 2 values... and the format
-// of the file doesn't seem to be standard? So this should be fine...
-fn getUserIdRange(allocator: std.mem.Allocator, login_defs_path: []const u8) !UidRange {
-    const login_defs_file = try std.fs.cwd().openFile(login_defs_path, .{});
-    defer login_defs_file.close();
-
-    const login_defs_buffer = try login_defs_file.readToEndAlloc(allocator, std.math.maxInt(u16));
-    defer allocator.free(login_defs_buffer);
-
-    var iterator = std.mem.splitScalar(u8, login_defs_buffer, '\n');
-    var uid_range = UidRange{};
-
-    while (iterator.next()) |line| {
-        const trimmed_line = std.mem.trim(u8, line, " \n\r\t");
-
-        if (std.mem.startsWith(u8, trimmed_line, "UID_MIN")) {
-            uid_range.uid_min = try parseValue(std.posix.uid_t, "UID_MIN", trimmed_line);
-        } else if (std.mem.startsWith(u8, trimmed_line, "UID_MAX")) {
-            uid_range.uid_max = try parseValue(std.posix.uid_t, "UID_MAX", trimmed_line);
-        }
-    }
-
-    return uid_range;
-}
-
-fn parseValue(comptime T: type, name: []const u8, buffer: []const u8) !T {
-    var iterator = std.mem.splitAny(u8, buffer, " \t");
-    var maybe_value: ?T = null;
-
-    while (iterator.next()) |slice| {
-        // Skip the slice if it's empty (whitespace) or is the name of the
-        // property (e.g. UID_MIN or UID_MAX)
-        if (slice.len == 0 or std.mem.eql(u8, slice, name)) continue;
-        maybe_value = std.fmt.parseInt(T, slice, 10) catch continue;
-    }
-
-    return maybe_value orelse error.ValueNotFound;
 }
 
 fn adjustBrightness(allocator: std.mem.Allocator, cmd: []const u8) !void {
